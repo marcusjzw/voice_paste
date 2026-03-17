@@ -10,7 +10,7 @@ Uses OpenAI's `gpt-4o-transcribe` model. Menu bar icon shows 🎙 at rest and �
 
 voice_paste uses OpenAI's Whisper API to transcribe your audio. You'll need an API key before setup.
 
-1. Go to [platform.openai.com](https://platform.openai.com) and sign in (or create a free account)
+1. Go to [platform.openai.com](https://platform.openai.com) and sign in.
 2. Click your profile icon (top-right) → **Your profile** → **[API keys](https://platform.openai.com/api-keys)** in the left sidebar
 3. Click **+ Create new secret key**, give it a name (e.g. `voice_paste`), and click **Create**
 4. **Copy the key immediately** — OpenAI only shows it once
