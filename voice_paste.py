@@ -5,7 +5,7 @@ voice_paste.py
 Hold Ctrl+Space to record. Release to transcribe via OpenAI Whisper and
 paste the result at your cursor — on any app, any surface.
 
-Menu bar: 🎙 idle  |  🔴 0s / 1s / 2s… while recording
+Menu bar: 🎙 idle  |  🔴 0s / 1s / 2s… while recording  |  ⠸ spinner while transcribing
 Mic selection available from the menu bar icon.
 
 Requirements: see requirements.txt
@@ -54,6 +54,7 @@ client = OpenAI(api_key=API_KEY)
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 _recording        = False
+_transcribing     = False
 _ctrl_held        = False
 _space_held       = False
 _frames: list[np.ndarray] = []
@@ -62,6 +63,9 @@ _state_lock       = threading.Lock()
 _recording_start  = 0.0        # time.time() when recording began
 _selected_device  = None       # None = system default; int = device index
 _app              = None       # set after rumps app is created
+
+_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_spinner_idx = 0
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -107,9 +111,11 @@ def _record_loop() -> None:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def _transcribe_and_paste() -> None:
+    global _transcribing
     if not _frames:
         print("[voice_paste] No audio captured.")
         return
+    _transcribing = True
 
     audio = np.concatenate(_frames, axis=0).flatten()
     pcm   = (audio * 32_767).astype(np.int16)
@@ -142,6 +148,7 @@ def _transcribe_and_paste() -> None:
     except Exception as exc:
         print(f"\n[voice_paste] Error: {exc}")
     finally:
+        _transcribing = False
         os.unlink(tmp)
 
 
@@ -249,6 +256,7 @@ class VoicePasteApp(rumps.App):
     # ── Timer: updates icon on main thread every 100ms ───────────────────
     @rumps.timer(0.1)
     def sync_title(self, _):
+        global _spinner_idx
         # Hide from Dock on first tick — main thread, fully initialised by now
         if not hasattr(self, "_dock_hidden"):
             try:
@@ -263,6 +271,9 @@ class VoicePasteApp(rumps.App):
         if _recording:
             elapsed = int(time.time() - _recording_start)
             self.title = f"🔴 {elapsed}s"
+        elif _transcribing:
+            self.title = _SPINNER[_spinner_idx % len(_SPINNER)]
+            _spinner_idx += 1
         else:
             if self.title != "🎙":
                 self.title = "🎙"
@@ -279,7 +290,7 @@ if __name__ == "__main__":
     print("─────────────────────────────────────────────")
     print("  VoicePaste  ready")
     print("  Hold  Ctrl+Space  to record, release to paste")
-    print("  Menu bar: 🎙 idle  →  🔴 Ns while recording")
+    print("  Menu bar: 🎙 idle  →  🔴 Ns recording  →  ⠸ transcribing")
     print("  Click menu bar icon to select mic or quit")
     print("─────────────────────────────────────────────\n")
 
