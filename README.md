@@ -16,8 +16,6 @@ voice_paste uses OpenAI's Whisper API to transcribe your audio. You'll need an A
 4. **Copy the key immediately** — OpenAI only shows it once
 5. You'll paste it when `setup.sh` asks for your API key
 
-> **Billing note:** The API is pay-as-you-go. Add a payment method at **Settings → Billing** and set a monthly spending limit. Typical usage costs a few cents per day.
-
 ---
 
 ## Requirements
