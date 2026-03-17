@@ -6,6 +6,20 @@ Uses OpenAI's `gpt-4o-transcribe` model. Menu bar icon shows 🎙 at rest and �
 
 ---
 
+## Step 0: Get an OpenAI API key
+
+voice_paste uses OpenAI's Whisper API to transcribe your audio. You'll need an API key before setup.
+
+1. Go to [platform.openai.com](https://platform.openai.com) and sign in (or create a free account)
+2. Click your profile icon (top-right) → **Your profile** → **[API keys](https://platform.openai.com/api-keys)** in the left sidebar
+3. Click **+ Create new secret key**, give it a name (e.g. `voice_paste`), and click **Create**
+4. **Copy the key immediately** — OpenAI only shows it once
+5. You'll paste it when `setup.sh` asks for your API key
+
+> **Billing note:** The API is pay-as-you-go. Add a payment method at **Settings → Billing** and set a monthly spending limit. Typical usage costs a few cents per day.
+
+---
+
 ## Requirements
 
 - macOS 12+
