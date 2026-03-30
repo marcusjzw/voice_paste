@@ -73,32 +73,33 @@ _REPO_DIR         = pathlib.Path(__file__).parent
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
 
-# ── Chimes (generated at import time, no audio files needed) ─────────────────
-_CHIME_RATE = 44_100
+# ── Chimes (WAV files written once at startup, played via afplay) ─────────────
+_CHIME_RATE      = 44_100
+_START_CHIME_WAV = os.path.join(tempfile.gettempdir(), "voice_paste_start.wav")
+_STOP_CHIME_WAV  = os.path.join(tempfile.gettempdir(), "voice_paste_stop.wav")
 
-def _make_chirp(f0: float, f1: float, dur: float = 0.12, vol: float = 0.22) -> np.ndarray:
+def _make_chirp(f0: float, f1: float, dur: float = 0.12, vol: float = 0.28) -> np.ndarray:
     """Linear frequency sweep with short fade-in/out to avoid clicks."""
     n     = int(_CHIME_RATE * dur)
-    t     = np.linspace(0, dur, n, endpoint=False)
     freq  = np.linspace(f0, f1, n)
     phase = 2 * np.pi * np.cumsum(freq) / _CHIME_RATE
     wave  = np.sin(phase)
-    ramp  = int(0.015 * _CHIME_RATE)          # 15 ms fade in/out
+    ramp  = int(0.015 * _CHIME_RATE)
     fade  = np.ones(n)
     fade[:ramp]  = np.linspace(0, 1, ramp)
     fade[-ramp:] = np.linspace(1, 0, ramp)
-    return (wave * fade * vol).astype(np.float32)
+    return (wave * fade * vol).astype(np.int16)
 
-_START_CHIME = _make_chirp(380, 920, vol=0.35)  # ascending  — "ready" (louder to compensate for low-freq start)
-_STOP_CHIME  = _make_chirp(920, 380, vol=0.22)  # descending — "done"
+wavfile.write(_START_CHIME_WAV, _CHIME_RATE, _make_chirp(380, 920))  # ascending
+wavfile.write(_STOP_CHIME_WAV,  _CHIME_RATE, _make_chirp(920, 380))  # descending
 
-def _play_chime(samples: np.ndarray) -> None:
-    """Play a chime on its own OutputStream so concurrent chimes don't clobber each other."""
-    try:
-        with sd.OutputStream(samplerate=_CHIME_RATE, channels=1, dtype="float32") as stream:
-            stream.write(samples)
-    except Exception as exc:
-        print(f"[voice_paste] Chime error: {exc}", flush=True)
+def _play_chime(path: str) -> None:
+    """Fire-and-forget via afplay — returns instantly, no stream overhead."""
+    subprocess.Popen(
+        ["afplay", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -243,13 +244,9 @@ def _start_recording() -> None:
         _recording = True
         _recording_start = time.time()
 
-    def _chime_then_record():
-        global _rec_thread
-        _play_chime(_START_CHIME)          # ~120 ms — finishes before mic opens
-        _rec_thread = threading.Thread(target=_record_loop, daemon=True)
-        _rec_thread.start()
-
-    threading.Thread(target=_chime_then_record, daemon=True).start()
+    _play_chime(_START_CHIME_WAV)
+    _rec_thread = threading.Thread(target=_record_loop, daemon=True)
+    _rec_thread.start()
     print("[voice_paste] Recording started")
 
 
@@ -264,7 +261,7 @@ def _stop_recording() -> None:
     if _rec_thread:
         _rec_thread.join(timeout=0.5)
 
-    threading.Thread(target=_play_chime, args=(_STOP_CHIME,), daemon=True).start()
+    _play_chime(_STOP_CHIME_WAV)
     threading.Thread(target=_transcribe_and_paste, daemon=True).start()
 
 
@@ -296,7 +293,7 @@ def _on_release(key) -> None:
 # ║  MENU BAR APP  (main thread — required by macOS)                        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-_IDLE_TITLE = f"🎙 v{VERSION}"
+_IDLE_TITLE = "🎙"
 
 class VoicePasteApp(rumps.App):
     def __init__(self):
@@ -388,7 +385,7 @@ if __name__ == "__main__":
     print("─────────────────────────────────────────────")
     print(f"  VoicePaste v{VERSION}  ready")
     print("  Hold  Ctrl+Space  to record, release to paste")
-    print(f"  Menu bar: {_IDLE_TITLE} idle  →  🔴 Ns recording  →  ⠸ transcribing")
+    print("  Menu bar: 🎙 idle  →  🔴 Ns recording  →  ⠸ transcribing")
     print("  Click menu bar icon to select mic or quit")
     print("─────────────────────────────────────────────\n")
 
