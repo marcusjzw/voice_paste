@@ -18,6 +18,7 @@ import time
 import threading
 import tempfile
 import subprocess
+import pathlib
 
 import numpy as np
 import sounddevice as sd
@@ -25,6 +26,10 @@ import scipy.io.wavfile as wavfile
 from pynput import keyboard
 from openai import OpenAI
 import rumps
+
+# ── Version ──────────────────────────────────────────────────────────────────
+_VERSION_FILE = pathlib.Path(__file__).parent / "VERSION"
+VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else "unknown"
 
 # ── Load .env (always overrides shell env) ───────────────────────────────────
 try:
@@ -63,9 +68,96 @@ _state_lock       = threading.Lock()
 _recording_start  = 0.0        # time.time() when recording began
 _selected_device  = None       # None = system default; int = device index
 _app              = None       # set after rumps app is created
+_REPO_DIR         = pathlib.Path(__file__).parent
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
+
+# ── Chimes (WAV files written once at startup, played via afplay) ─────────────
+_CHIME_RATE      = 44_100
+_START_CHIME_WAV = os.path.join(tempfile.gettempdir(), "voice_paste_start.wav")
+_STOP_CHIME_WAV  = os.path.join(tempfile.gettempdir(), "voice_paste_stop.wav")
+
+def _make_chirp(f0: float, f1: float, dur: float = 0.12, vol: float = 0.28) -> np.ndarray:
+    """Linear frequency sweep with short fade-in/out to avoid clicks."""
+    n     = int(_CHIME_RATE * dur)
+    freq  = np.linspace(f0, f1, n)
+    phase = 2 * np.pi * np.cumsum(freq) / _CHIME_RATE
+    wave  = np.sin(phase)
+    ramp  = int(0.015 * _CHIME_RATE)
+    fade  = np.ones(n)
+    fade[:ramp]  = np.linspace(0, 1, ramp)
+    fade[-ramp:] = np.linspace(1, 0, ramp)
+    return (wave * fade * vol).astype(np.int16)
+
+wavfile.write(_START_CHIME_WAV, _CHIME_RATE, _make_chirp(380, 920))  # ascending
+wavfile.write(_STOP_CHIME_WAV,  _CHIME_RATE, _make_chirp(920, 380))  # descending
+
+# Load NSSound objects once at startup (in-process, no subprocess overhead)
+try:
+    import AppKit as _AppKit
+    from Foundation import NSObject as _NSObject
+
+    class _SoundDispatcher(_NSObject):
+        """Thin NSObject so we can use performSelectorOnMainThread for instant dispatch."""
+        def playSound_(self, sound):
+            sound.stop()
+            sound.play()
+
+    _dispatcher  = _SoundDispatcher.new()
+    _START_SOUND = _AppKit.NSSound.soundNamed_("Glass")
+    _STOP_SOUND  = _AppKit.NSSound.soundNamed_("Pop")
+except Exception as _e:
+    print(f"[voice_paste] Could not load chimes: {_e}", flush=True)
+    _dispatcher = _START_SOUND = _STOP_SOUND = None
+
+def _queue_chime(sound) -> None:
+    """Dispatch sound.play() to the main run loop instantly (no timer lag)."""
+    if _dispatcher is not None and sound is not None:
+        _dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "playSound:", sound, False
+        )
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  AUTO-UPDATE                                                            ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def _check_and_update() -> None:
+    """Fetch from origin; if behind, pull and restart the process."""
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin", "master"],
+            cwd=_REPO_DIR, capture_output=True, timeout=10,
+        )
+        local  = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=_REPO_DIR, text=True
+        ).strip()
+        remote = subprocess.check_output(
+            ["git", "rev-parse", "origin/master"], cwd=_REPO_DIR, text=True
+        ).strip()
+
+        if local == remote:
+            print(f"[voice_paste] v{VERSION} — up to date.")
+            return
+
+        print(f"[voice_paste] New version available — updating…")
+        result = subprocess.run(
+            ["git", "pull", "--ff-only", "origin", "master"],
+            cwd=_REPO_DIR, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"[voice_paste] Update failed:\n{result.stderr}")
+            return
+
+        # Reload version string after pull
+        new_ver = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else "?"
+        print(f"[voice_paste] Updated to v{new_ver} — restarting…")
+        time.sleep(0.5)   # let the log line flush
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    except Exception as exc:
+        print(f"[voice_paste] Update check skipped: {exc}")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -91,19 +183,24 @@ def _record_loop() -> None:
     _frames = []
 
     def _cb(indata, frames, t, status):
+        if status:
+            print(f"[voice_paste] Audio status: {status}", flush=True)
         if _recording:
             _frames.append(indata.copy())
 
-    with sd.InputStream(
-        device=_selected_device,
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="float32",
-        blocksize=1024,
-        callback=_cb,
-    ):
-        while _recording:
-            time.sleep(0.01)
+    try:
+        with sd.InputStream(
+            device=_selected_device,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=1024,
+            callback=_cb,
+        ):
+            while _recording:
+                time.sleep(0.01)
+    except Exception as exc:
+        print(f"[voice_paste] Audio capture error: {exc}", flush=True)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -146,7 +243,7 @@ def _transcribe_and_paste() -> None:
             print("[voice_paste] Whisper returned empty transcript.")
 
     except Exception as exc:
-        print(f"\n[voice_paste] Error: {exc}")
+        print(f"\n[voice_paste] Error: {exc}", flush=True)
     finally:
         _transcribing = False
         os.unlink(tmp)
@@ -164,6 +261,7 @@ def _start_recording() -> None:
         _recording = True
         _recording_start = time.time()
 
+    _queue_chime(_START_SOUND)
     _rec_thread = threading.Thread(target=_record_loop, daemon=True)
     _rec_thread.start()
     print("[voice_paste] Recording started")
@@ -180,6 +278,7 @@ def _stop_recording() -> None:
     if _rec_thread:
         _rec_thread.join(timeout=0.5)
 
+    _queue_chime(_STOP_SOUND)
     threading.Thread(target=_transcribe_and_paste, daemon=True).start()
 
 
@@ -211,13 +310,20 @@ def _on_release(key) -> None:
 # ║  MENU BAR APP  (main thread — required by macOS)                        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
+_IDLE_TITLE = "🎙"
+
 class VoicePasteApp(rumps.App):
     def __init__(self):
         # "VoicePaste" = app name (Activity Monitor + "Quit VoicePaste" label)
         # self.title overrides what's displayed in the menu bar itself
         super().__init__("VoicePaste")
-        self.title = "🎙"
+        self.title = _IDLE_TITLE
         self._build_mic_menu()
+        # Version info item (non-clickable)
+        ver_item = rumps.MenuItem(f"VoicePaste v{VERSION}")
+        ver_item.set_callback(None)
+        self.menu.add(ver_item)
+        self.menu.add(rumps.separator)
 
     # ── Mic selector ─────────────────────────────────────────────────────
     def _build_mic_menu(self):
@@ -257,6 +363,7 @@ class VoicePasteApp(rumps.App):
     @rumps.timer(0.1)
     def sync_title(self, _):
         global _spinner_idx
+
         # Hide from Dock on first tick — main thread, fully initialised by now
         if not hasattr(self, "_dock_hidden"):
             try:
@@ -275,8 +382,8 @@ class VoicePasteApp(rumps.App):
             self.title = _SPINNER[_spinner_idx % len(_SPINNER)]
             _spinner_idx += 1
         else:
-            if self.title != "🎙":
-                self.title = "🎙"
+            if self.title != _IDLE_TITLE:
+                self.title = _IDLE_TITLE
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -284,11 +391,17 @@ class VoicePasteApp(rumps.App):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 if __name__ == "__main__":
+    # Auto-update: runs synchronously so a restart happens before the UI appears.
+    # Wrapped in a thread with a timeout guard so a slow network can't stall startup.
+    update_thread = threading.Thread(target=_check_and_update, daemon=True)
+    update_thread.start()
+    update_thread.join(timeout=15)   # max 15 s wait; continue regardless
+
     listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
     listener.start()
 
     print("─────────────────────────────────────────────")
-    print("  VoicePaste  ready")
+    print(f"  VoicePaste v{VERSION}  ready")
     print("  Hold  Ctrl+Space  to record, release to paste")
     print("  Menu bar: 🎙 idle  →  🔴 Ns recording  →  ⠸ transcribing")
     print("  Click menu bar icon to select mic or quit")
