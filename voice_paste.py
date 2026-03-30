@@ -91,19 +91,24 @@ def _record_loop() -> None:
     _frames = []
 
     def _cb(indata, frames, t, status):
+        if status:
+            print(f"[voice_paste] Audio status: {status}", flush=True)
         if _recording:
             _frames.append(indata.copy())
 
-    with sd.InputStream(
-        device=_selected_device,
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="float32",
-        blocksize=1024,
-        callback=_cb,
-    ):
-        while _recording:
-            time.sleep(0.01)
+    try:
+        with sd.InputStream(
+            device=_selected_device,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=1024,
+            callback=_cb,
+        ):
+            while _recording:
+                time.sleep(0.01)
+    except Exception as exc:
+        print(f"[voice_paste] Audio capture error: {exc}", flush=True)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -146,7 +151,7 @@ def _transcribe_and_paste() -> None:
             print("[voice_paste] Whisper returned empty transcript.")
 
     except Exception as exc:
-        print(f"\n[voice_paste] Error: {exc}")
+        print(f"\n[voice_paste] Error: {exc}", flush=True)
     finally:
         _transcribing = False
         os.unlink(tmp)

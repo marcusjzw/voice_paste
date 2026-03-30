@@ -21,7 +21,7 @@ fi
 
 # ── Launch ────────────────────────────────────────────────────────────────
 echo "Starting voice_paste…"
-nohup python3 "$SCRIPT_DIR/voice_paste.py" > "$LOG" 2>&1 &
+nohup python3 -u "$SCRIPT_DIR/voice_paste.py" > "$LOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
 
