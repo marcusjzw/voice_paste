@@ -2,7 +2,15 @@
 
 Hold **Ctrl+Space** to record your voice. Release to transcribe and paste the text wherever your cursor is — any app, any surface.
 
-Uses OpenAI's `gpt-4o-transcribe` model. Menu bar icon shows 🎙 at rest and 🔴 while recording.
+Uses OpenAI's `gpt-4o-transcribe` model. Menu bar icon shows status at a glance:
+
+| Icon | State |
+|---|---|
+| 🎙 | Idle |
+| 🔴 Ns | Recording (elapsed seconds) |
+| ⠸ | Transcribing |
+
+A short chime plays on release to confirm the recording was captured.
 
 ---
 
@@ -55,7 +63,17 @@ macOS reserves Ctrl+Space for input source switching. Disable it at:
 - Your terminal app (Terminal, iTerm2, Warp, etc.)
 - The Python binary itself — find it with `which python3`, then add that path
 
-Both at: `System Settings → Privacy & Security → Accessibility → + `
+Both at: `System Settings → Privacy & Security → Accessibility → +`
+
+**3. Grant Microphone access**
+
+On first use, macOS will prompt to grant microphone access to your terminal app. Click **Allow**. If you missed the prompt, reset it with:
+
+```bash
+tccutil reset Microphone
+```
+
+Then relaunch voice_paste to trigger the prompt again.
 
 ---
 
@@ -69,6 +87,8 @@ bash start.sh
 python3 voice_paste.py
 ```
 
+Logs are written to `voice_paste.log` in the project folder.
+
 To stop:
 ```bash
 kill $(cat voice_paste.pid)
@@ -81,7 +101,9 @@ kill $(cat voice_paste.pid)
 1. Click into any text field (Slack, Notion, browser, email — anywhere)
 2. Hold **Ctrl+Space** — menu bar icon turns 🔴
 3. Speak
-4. Release **Ctrl+Space** — text is transcribed and pasted at your cursor
+4. Release **Ctrl+Space** — a chime plays, text is transcribed and pasted at your cursor
+
+**Changing microphone:** Click the menu bar icon → **Microphone** to select any available input device.
 
 ---
 
@@ -103,6 +125,11 @@ LANGUAGE = "en"                 # set to None for automatic language detection
 - Make sure the macOS Ctrl+Space shortcut is disabled (see above)
 - Run `python3 voice_paste.py` in the foreground and check for errors
 
+**No audio captured / transcription returns empty**
+- Check microphone permission: `System Settings → Privacy & Security → Microphone`
+- If it's missing or stuck, reset with `tccutil reset Microphone` and relaunch
+- Check `voice_paste.log` for "Audio capture error" lines
+
 **Wrong API key / 401 error**
 - Your key lives in `voice_paste/.env` — edit it directly: `nano .env`
 - Make sure `OPENAI_API_KEY` is not also set in `~/.zshrc` (that will override `.env`)
@@ -112,8 +139,10 @@ LANGUAGE = "en"                 # set to None for automatic language detection
 - Make sure focus stays in your target field before pressing Ctrl+Space
 - Don't click away while recording
 
-**App crashes on longer recordings**
-- Make sure you're on the latest `voice_paste.py` — earlier versions updated the menu bar icon from a background thread, which macOS doesn't allow
+**Checking logs**
+```bash
+tail -f voice_paste.log
+```
 
 ---
 
@@ -132,19 +161,33 @@ Typical voice note (15 sec) costs roughly $0.0015. Negligible for daily use.
 
 ```
 voice_paste/
-├── voice_paste.py   # main script
-├── setup.sh         # one-time setup
-├── start.sh         # background launcher
-├── requirements.txt # Python dependencies
-├── .env             # your API key (never commit this)
-└── README.md
+├── voice_paste.py      # main script
+├── setup.sh            # one-time setup
+├── start.sh            # background launcher
+├── install_login.sh    # auto-start on login via LaunchAgent
+├── requirements.txt    # Python dependencies
+├── VERSION             # current version number
+├── voice_paste.log     # runtime logs (created on first run)
+├── voice_paste.pid     # PID of running background process
+└── .env                # your API key (never commit this)
 ```
 
 ---
 
 ## Auto-start on login (optional)
 
-Add to your `~/.zshrc`:
+Use the included LaunchAgent installer to have voice_paste start automatically on every login:
+
 ```bash
-bash ~/path/to/voice_paste/start.sh
+bash install_login.sh
+```
+
+To stop auto-starting:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.voicepaste.plist
+```
+
+To remove it entirely:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.voicepaste.plist && rm ~/Library/LaunchAgents/com.voicepaste.plist
 ```
