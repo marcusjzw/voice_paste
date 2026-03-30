@@ -73,27 +73,7 @@ _REPO_DIR         = pathlib.Path(__file__).parent
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
 
-# ── Chimes (WAV files written once at startup, played via afplay) ─────────────
-_CHIME_RATE      = 44_100
-_START_CHIME_WAV = os.path.join(tempfile.gettempdir(), "voice_paste_start.wav")
-_STOP_CHIME_WAV  = os.path.join(tempfile.gettempdir(), "voice_paste_stop.wav")
-
-def _make_chirp(f0: float, f1: float, dur: float = 0.12, vol: float = 0.28) -> np.ndarray:
-    """Linear frequency sweep with short fade-in/out to avoid clicks."""
-    n     = int(_CHIME_RATE * dur)
-    freq  = np.linspace(f0, f1, n)
-    phase = 2 * np.pi * np.cumsum(freq) / _CHIME_RATE
-    wave  = np.sin(phase)
-    ramp  = int(0.015 * _CHIME_RATE)
-    fade  = np.ones(n)
-    fade[:ramp]  = np.linspace(0, 1, ramp)
-    fade[-ramp:] = np.linspace(1, 0, ramp)
-    return (wave * fade * vol).astype(np.int16)
-
-wavfile.write(_START_CHIME_WAV, _CHIME_RATE, _make_chirp(380, 920))  # ascending
-wavfile.write(_STOP_CHIME_WAV,  _CHIME_RATE, _make_chirp(920, 380))  # descending
-
-# Load NSSound objects once at startup (in-process, no subprocess overhead)
+# ── Stop chime (plays on release via NSSound on the main thread) ──────────────
 try:
     import AppKit as _AppKit
     from Foundation import NSObject as _NSObject
@@ -104,18 +84,18 @@ try:
             sound.stop()
             sound.play()
 
-    _dispatcher  = _SoundDispatcher.new()
-    _START_SOUND = _AppKit.NSSound.soundNamed_("Glass")
-    _STOP_SOUND  = _AppKit.NSSound.soundNamed_("Pop")
+    _dispatcher = _SoundDispatcher.new()
+    _STOP_SOUND = _AppKit.NSSound.soundNamed_("Pop").copy()
+    _STOP_SOUND.setVolume_(0.5)
 except Exception as _e:
-    print(f"[voice_paste] Could not load chimes: {_e}", flush=True)
-    _dispatcher = _START_SOUND = _STOP_SOUND = None
+    print(f"[voice_paste] Could not load stop chime: {_e}", flush=True)
+    _dispatcher = _STOP_SOUND = None
 
-def _queue_chime(sound) -> None:
-    """Dispatch sound.play() to the main run loop instantly (no timer lag)."""
-    if _dispatcher is not None and sound is not None:
+def _play_stop_chime() -> None:
+    """Dispatch Pop chime to the main run loop."""
+    if _dispatcher is not None and _STOP_SOUND is not None:
         _dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_(
-            "playSound:", sound, False
+            "playSound:", _STOP_SOUND, False
         )
 
 
@@ -261,7 +241,6 @@ def _start_recording() -> None:
         _recording = True
         _recording_start = time.time()
 
-    _queue_chime(_START_SOUND)
     _rec_thread = threading.Thread(target=_record_loop, daemon=True)
     _rec_thread.start()
     print("[voice_paste] Recording started")
@@ -278,7 +257,7 @@ def _stop_recording() -> None:
     if _rec_thread:
         _rec_thread.join(timeout=0.5)
 
-    _queue_chime(_STOP_SOUND)
+    _play_stop_chime()
     threading.Thread(target=_transcribe_and_paste, daemon=True).start()
 
 
