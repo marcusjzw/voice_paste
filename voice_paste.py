@@ -93,13 +93,30 @@ def _make_chirp(f0: float, f1: float, dur: float = 0.12, vol: float = 0.28) -> n
 wavfile.write(_START_CHIME_WAV, _CHIME_RATE, _make_chirp(380, 920))  # ascending
 wavfile.write(_STOP_CHIME_WAV,  _CHIME_RATE, _make_chirp(920, 380))  # descending
 
-def _play_chime(path: str) -> None:
-    """Fire-and-forget via afplay — returns instantly, no stream overhead."""
-    subprocess.Popen(
-        ["afplay", path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+# Load NSSound objects once at startup (in-process, no subprocess overhead)
+try:
+    import AppKit as _AppKit
+    from Foundation import NSObject as _NSObject
+
+    class _SoundDispatcher(_NSObject):
+        """Thin NSObject so we can use performSelectorOnMainThread for instant dispatch."""
+        def playSound_(self, sound):
+            sound.stop()
+            sound.play()
+
+    _dispatcher  = _SoundDispatcher.new()
+    _START_SOUND = _AppKit.NSSound.soundNamed_("Glass")
+    _STOP_SOUND  = _AppKit.NSSound.soundNamed_("Pop")
+except Exception as _e:
+    print(f"[voice_paste] Could not load chimes: {_e}", flush=True)
+    _dispatcher = _START_SOUND = _STOP_SOUND = None
+
+def _queue_chime(sound) -> None:
+    """Dispatch sound.play() to the main run loop instantly (no timer lag)."""
+    if _dispatcher is not None and sound is not None:
+        _dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "playSound:", sound, False
+        )
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -244,7 +261,7 @@ def _start_recording() -> None:
         _recording = True
         _recording_start = time.time()
 
-    _play_chime(_START_CHIME_WAV)
+    _queue_chime(_START_SOUND)
     _rec_thread = threading.Thread(target=_record_loop, daemon=True)
     _rec_thread.start()
     print("[voice_paste] Recording started")
@@ -261,7 +278,7 @@ def _stop_recording() -> None:
     if _rec_thread:
         _rec_thread.join(timeout=0.5)
 
-    _play_chime(_STOP_CHIME_WAV)
+    _queue_chime(_STOP_SOUND)
     threading.Thread(target=_transcribe_and_paste, daemon=True).start()
 
 
@@ -346,6 +363,7 @@ class VoicePasteApp(rumps.App):
     @rumps.timer(0.1)
     def sync_title(self, _):
         global _spinner_idx
+
         # Hide from Dock on first tick — main thread, fully initialised by now
         if not hasattr(self, "_dock_hidden"):
             try:
