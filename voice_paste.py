@@ -302,6 +302,7 @@ class VoicePasteApp(rumps.App):
         ver_item = rumps.MenuItem(f"VoicePaste v{VERSION}")
         ver_item.set_callback(None)
         self.menu.add(ver_item)
+        self.menu.add(rumps.MenuItem("Restart", callback=self._on_restart))
         self.menu.add(rumps.separator)
 
     # ── Mic selector ─────────────────────────────────────────────────────
@@ -325,6 +326,10 @@ class VoicePasteApp(rumps.App):
         self.menu.add(mic_menu)
         self.menu.add(rumps.separator)
         self._mic_menu = mic_menu
+
+    def _on_restart(self, _):
+        print("[voice_paste] Restarting…", flush=True)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _on_mic_select(self, sender):
         global _selected_device
