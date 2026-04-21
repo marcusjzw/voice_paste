@@ -329,7 +329,12 @@ class VoicePasteApp(rumps.App):
 
     def _on_restart(self, _):
         print("[voice_paste] Restarting…", flush=True)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        subprocess.Popen(
+            [sys.executable, str(pathlib.Path(__file__).resolve())],
+            start_new_session=True,
+            close_fds=True,
+        )
+        rumps.quit_application()
 
     def _on_mic_select(self, sender):
         global _selected_device
