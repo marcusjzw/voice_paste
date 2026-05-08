@@ -38,6 +38,7 @@ cat > "$PLIST" << EOF
   <key>ProgramArguments</key>
   <array>
     <string>$PYTHON</string>
+    <string>-u</string>
     <string>$SCRIPT_DIR/voice_paste.py</string>
   </array>
 
