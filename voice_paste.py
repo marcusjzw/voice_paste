@@ -78,6 +78,10 @@ _ERROR_DEBOUNCE_S = 1.5        # min seconds between consecutive error signals
 _LOCK_FILE        = pathlib.Path(__file__).parent / "voice_paste.lock"
 _lock_fh          = None       # held-open file handle for the single-instance flock
 
+_last_device_check  = 0.0      # time.time() of last device-list rescan
+_DEVICE_REFRESH_S   = 2.0      # min seconds between mic-menu rebuilds
+_known_device_names: tuple = ()  # cached snapshot of input device names
+
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
 
@@ -428,25 +432,50 @@ class VoicePasteApp(rumps.App):
 
     # ── Mic selector ─────────────────────────────────────────────────────
     def _build_mic_menu(self):
-        devices = _get_input_devices()
-        mic_menu = rumps.MenuItem("Microphone")
+        self._mic_menu = rumps.MenuItem("Microphone")
+        self._populate_mic_menu()
+        self.menu.add(self._mic_menu)
+        self.menu.add(rumps.separator)
 
-        # "Default" option at the top
+    def _populate_mic_menu(self):
+        """Fill the mic submenu with current input devices.
+
+        Always shows: System Default + currently connected input devices.
+        If the saved selection isn't currently connected, it's appended at
+        the bottom marked '(disconnected)' so the user can see what they
+        picked, and so reconnecting auto-resumes the choice.
+        """
+        global _known_device_names
+        self._mic_menu.clear()
+
+        devices = _get_input_devices()
+        connected_names = [name for _, name in devices]
+        _known_device_names = tuple(connected_names)
+
         default_item = rumps.MenuItem("System Default", callback=self._on_mic_select)
         default_item._device_name = None
-        default_item.state = 1   # checked by default
-        mic_menu.add(default_item)
-        mic_menu.add(rumps.separator)
+        default_item.state = 1 if _selected_device_name is None else 0
+        self._mic_menu.add(default_item)
+        self._mic_menu.add(rumps.separator)
 
-        for _idx, name in devices:
+        for name in connected_names:
             item = rumps.MenuItem(name, callback=self._on_mic_select)
             item._device_name = name
-            item.state = 0
-            mic_menu.add(item)
+            item.state = 1 if name == _selected_device_name else 0
+            self._mic_menu.add(item)
 
-        self.menu.add(mic_menu)
-        self.menu.add(rumps.separator)
-        self._mic_menu = mic_menu
+        if (
+            _selected_device_name is not None
+            and _selected_device_name not in connected_names
+        ):
+            self._mic_menu.add(rumps.separator)
+            ghost = rumps.MenuItem(
+                f"{_selected_device_name} (disconnected)",
+                callback=self._on_mic_select,
+            )
+            ghost._device_name = _selected_device_name
+            ghost.state = 1
+            self._mic_menu.add(ghost)
 
     def _on_restart(self, _):
         print("[voice_paste] Restarting…", flush=True)
@@ -472,7 +501,7 @@ class VoicePasteApp(rumps.App):
     # ── Timer: updates icon on main thread every 100ms ───────────────────
     @rumps.timer(0.1)
     def sync_title(self, _):
-        global _spinner_idx
+        global _spinner_idx, _last_device_check
 
         # Hide from Dock on first tick — main thread, fully initialised by now
         if not hasattr(self, "_dock_hidden"):
@@ -484,6 +513,18 @@ class VoicePasteApp(rumps.App):
             except Exception:
                 pass
             self._dock_hidden = True
+
+        # Rescan input devices periodically; rebuild the mic menu on change.
+        # Skipped during recording to avoid touching menu state mid-stream.
+        now = time.time()
+        if not _recording and now - _last_device_check >= _DEVICE_REFRESH_S:
+            _last_device_check = now
+            try:
+                current = tuple(name for _, name in _get_input_devices())
+                if current != _known_device_names:
+                    self._populate_mic_menu()
+            except Exception as exc:
+                print(f"[voice_paste] Device refresh error: {exc}", flush=True)
 
         if _recording:
             elapsed = int(time.time() - _recording_start)
