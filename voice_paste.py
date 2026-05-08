@@ -63,12 +63,15 @@ _transcribing     = False
 _ctrl_held        = False
 _space_held       = False
 _frames: list[np.ndarray] = []
-_rec_thread: threading.Thread | None = None
+_stream: "sd.InputStream | None" = None
 _state_lock       = threading.Lock()
 _recording_start  = 0.0        # time.time() when recording began
-_selected_device  = None       # None = system default; int = device index
+_selected_device_name: str | None = None  # None = system default; else CoreAudio device name
 _app              = None       # set after rumps app is created
 _REPO_DIR         = pathlib.Path(__file__).parent
+
+_error_until      = 0.0        # time.time() until which menu bar shows ⚠️
+_ERROR_DISPLAY_S  = 4.0        # seconds to keep ⚠️ visible after a failure
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
@@ -87,9 +90,11 @@ try:
     _dispatcher = _SoundDispatcher.new()
     _STOP_SOUND = _AppKit.NSSound.soundNamed_("Pop").copy()
     _STOP_SOUND.setVolume_(0.5)
+    _ERROR_SOUND = _AppKit.NSSound.soundNamed_("Funk").copy()
+    _ERROR_SOUND.setVolume_(0.6)
 except Exception as _e:
-    print(f"[voice_paste] Could not load stop chime: {_e}", flush=True)
-    _dispatcher = _STOP_SOUND = None
+    print(f"[voice_paste] Could not load chimes: {_e}", flush=True)
+    _dispatcher = _STOP_SOUND = _ERROR_SOUND = None
 
 def _play_stop_chime() -> None:
     """Dispatch Pop chime to the main run loop."""
@@ -97,6 +102,36 @@ def _play_stop_chime() -> None:
         _dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_(
             "playSound:", _STOP_SOUND, False
         )
+
+def _play_error_chime() -> None:
+    """Dispatch Funk chime to the main run loop."""
+    if _dispatcher is not None and _ERROR_SOUND is not None:
+        _dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "playSound:", _ERROR_SOUND, False
+        )
+
+def _notify(title: str, message: str) -> None:
+    """Post a transient macOS notification via osascript."""
+    import json as _json
+    try:
+        script = (
+            f"display notification {_json.dumps(message)} "
+            f"with title {_json.dumps(title)}"
+        )
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, timeout=2,
+        )
+    except Exception as exc:
+        print(f"[voice_paste] Notification failed: {exc}", flush=True)
+
+def _signal_capture_error(reason: str) -> None:
+    """Surface a recording failure: log, chime, notify, flash ⚠️ in menu bar."""
+    global _error_until
+    print(f"[voice_paste] Capture error: {reason}", flush=True)
+    _error_until = time.time() + _ERROR_DISPLAY_S
+    _play_error_chime()
+    _notify("VoicePaste — microphone unavailable", reason)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -154,33 +189,34 @@ def _get_input_devices() -> list[tuple[int, str]]:
     ]
 
 
+def _resolve_device_index(name: str | None) -> tuple[int | None, bool]:
+    """Look up the *current* PortAudio index for a device name.
+
+    Returns (device_index, found). For system default (name=None), returns
+    (None, True). If the name is not present in the current device list,
+    returns (None, False) so the caller can fall back to system default.
+    """
+    if name is None:
+        return None, True
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("name") == name and d.get("max_input_channels", 0) > 0:
+                return i, True
+    except Exception as exc:
+        print(f"[voice_paste] query_devices failed: {exc}", flush=True)
+    return None, False
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  AUDIO CAPTURE                                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def _record_loop() -> None:
-    global _frames
-    _frames = []
-
-    def _cb(indata, frames, t, status):
-        if status:
-            print(f"[voice_paste] Audio status: {status}", flush=True)
-        if _recording:
-            _frames.append(indata.copy())
-
-    try:
-        with sd.InputStream(
-            device=_selected_device,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=1024,
-            callback=_cb,
-        ):
-            while _recording:
-                time.sleep(0.01)
-    except Exception as exc:
-        print(f"[voice_paste] Audio capture error: {exc}", flush=True)
+def _audio_callback(indata, frames, t, status) -> None:
+    """PortAudio callback — appends frames while recording is active."""
+    if status:
+        print(f"[voice_paste] Audio status: {status}", flush=True)
+    if _recording:
+        _frames.append(indata.copy())
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -234,31 +270,74 @@ def _transcribe_and_paste() -> None:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def _start_recording() -> None:
-    global _recording, _rec_thread, _recording_start
+    """Open the input stream synchronously and only enter recording state on success."""
+    global _recording, _recording_start, _stream, _frames
+
     with _state_lock:
         if _recording:
             return
+
+        device_index, found = _resolve_device_index(_selected_device_name)
+        if _selected_device_name is not None and not found:
+            _signal_capture_error(
+                f"'{_selected_device_name}' is not connected — using system default"
+            )
+            device_index = None  # one-shot fallback; selection preserved for reconnect
+
+        _frames = []
+        try:
+            stream = sd.InputStream(
+                device=device_index,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="float32",
+                blocksize=1024,
+                callback=_audio_callback,
+            )
+            stream.start()
+        except Exception as exc:
+            try:
+                if "stream" in locals() and stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+            _signal_capture_error(f"Could not open microphone: {exc}")
+            return
+
+        _stream = stream
         _recording = True
         _recording_start = time.time()
 
-    _rec_thread = threading.Thread(target=_record_loop, daemon=True)
-    _rec_thread.start()
     print("[voice_paste] Recording started")
 
 
 def _stop_recording() -> None:
-    global _recording
+    global _recording, _stream
     with _state_lock:
         if not _recording:
             return
         _recording = False
-    print("[voice_paste] Recording stopped")
+        stream = _stream
+        _stream = None
+        duration = time.time() - _recording_start
 
-    if _rec_thread:
-        _rec_thread.join(timeout=0.5)
+    if stream is not None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as exc:
+            print(f"[voice_paste] Error closing stream: {exc}", flush=True)
 
-    _play_stop_chime()
-    threading.Thread(target=_transcribe_and_paste, daemon=True).start()
+    print(f"[voice_paste] Recording stopped ({duration:.2f}s)")
+
+    if _frames:
+        _play_stop_chime()
+        threading.Thread(target=_transcribe_and_paste, daemon=True).start()
+    elif duration > 0.5:
+        # Stream opened but produced zero frames over a held press — likely a silent
+        # mid-recording failure. Surface it so the user doesn't lose the monologue.
+        _signal_capture_error("No audio captured — the microphone may have disconnected mid-recording")
+    # else: too short to matter (accidental tap), stay silent.
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -312,14 +391,14 @@ class VoicePasteApp(rumps.App):
 
         # "Default" option at the top
         default_item = rumps.MenuItem("System Default", callback=self._on_mic_select)
-        default_item._device_index = None
+        default_item._device_name = None
         default_item.state = 1   # checked by default
         mic_menu.add(default_item)
         mic_menu.add(rumps.separator)
 
-        for idx, name in devices:
+        for _idx, name in devices:
             item = rumps.MenuItem(name, callback=self._on_mic_select)
-            item._device_index = idx
+            item._device_name = name
             item.state = 0
             mic_menu.add(item)
 
@@ -337,15 +416,15 @@ class VoicePasteApp(rumps.App):
         rumps.quit_application()
 
     def _on_mic_select(self, sender):
-        global _selected_device
-        _selected_device = sender._device_index
+        global _selected_device_name
+        _selected_device_name = sender._device_name
 
         # Update checkmarks
-        for key, item in self._mic_menu.items():
-            if isinstance(item, rumps.MenuItem) and hasattr(item, "_device_index"):
-                item.state = 1 if item._device_index == _selected_device else 0
+        for _key, item in self._mic_menu.items():
+            if isinstance(item, rumps.MenuItem) and hasattr(item, "_device_name"):
+                item.state = 1 if item._device_name == _selected_device_name else 0
 
-        label = "System Default" if _selected_device is None else sender.title
+        label = "System Default" if _selected_device_name is None else sender.title
         print(f"[voice_paste] Microphone set to: {label}")
 
     # ── Timer: updates icon on main thread every 100ms ───────────────────
@@ -370,6 +449,9 @@ class VoicePasteApp(rumps.App):
         elif _transcribing:
             self.title = _SPINNER[_spinner_idx % len(_SPINNER)]
             _spinner_idx += 1
+        elif time.time() < _error_until:
+            if self.title != "⚠️":
+                self.title = "⚠️"
         else:
             if self.title != _IDLE_TITLE:
                 self.title = _IDLE_TITLE
