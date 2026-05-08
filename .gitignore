@@ -5,8 +5,10 @@
 # Runtime files
 voice_paste.log
 voice_paste.pid
+voice_paste.lock
 *.log
 *.pid
+*.lock
 
 # Python
 __pycache__/

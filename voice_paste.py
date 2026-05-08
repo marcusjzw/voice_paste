@@ -19,6 +19,7 @@ import threading
 import tempfile
 import subprocess
 import pathlib
+import fcntl
 
 import numpy as np
 import sounddevice as sd
@@ -72,6 +73,10 @@ _REPO_DIR         = pathlib.Path(__file__).parent
 
 _error_until      = 0.0        # time.time() until which menu bar shows ⚠️
 _ERROR_DISPLAY_S  = 4.0        # seconds to keep ⚠️ visible after a failure
+_last_error_at    = 0.0        # time.time() of the most recent error chime
+_ERROR_DEBOUNCE_S = 1.5        # min seconds between consecutive error signals
+_LOCK_FILE        = pathlib.Path(__file__).parent / "voice_paste.lock"
+_lock_fh          = None       # held-open file handle for the single-instance flock
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
@@ -126,12 +131,49 @@ def _notify(title: str, message: str) -> None:
         print(f"[voice_paste] Notification failed: {exc}", flush=True)
 
 def _signal_capture_error(reason: str) -> None:
-    """Surface a recording failure: log, chime, notify, flash ⚠️ in menu bar."""
-    global _error_until
+    """Surface a recording failure: log, chime, notify, flash ⚠️ in menu bar.
+
+    Debounced so a tight retry loop (e.g. autorepeat key fires while the device
+    is unavailable) cannot stutter the chime at the system key-repeat rate.
+    """
+    global _error_until, _last_error_at
+    now = time.time()
     print(f"[voice_paste] Capture error: {reason}", flush=True)
-    _error_until = time.time() + _ERROR_DISPLAY_S
+    if now - _last_error_at < _ERROR_DEBOUNCE_S:
+        # Still within the debounce window from the previous signal — keep ⚠️
+        # visible but skip the chime + notification spam.
+        _error_until = now + _ERROR_DISPLAY_S
+        return
+    _last_error_at = now
+    _error_until = now + _ERROR_DISPLAY_S
     _play_error_chime()
     _notify("VoicePaste — microphone unavailable", reason)
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Try to take an exclusive flock so only one VoicePaste runs at a time.
+
+    Returns True if acquired (or if locking is unsupported and we should fail
+    open), False if another process already holds the lock.
+    """
+    global _lock_fh
+    try:
+        _lock_fh = open(_LOCK_FILE, "w")
+        fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except Exception as exc:
+        # Unexpected errors (e.g. fcntl unavailable) — don't block startup.
+        print(f"[voice_paste] Lock setup error (continuing): {exc}", flush=True)
+        return True
+    try:
+        _lock_fh.seek(0)
+        _lock_fh.truncate()
+        _lock_fh.write(f"{os.getpid()}\n")
+        _lock_fh.flush()
+    except Exception:
+        pass
+    return True
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -462,6 +504,16 @@ class VoicePasteApp(rumps.App):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 if __name__ == "__main__":
+    # Refuse to run if another VoicePaste is already alive. Two daemons would
+    # both grab the audio device on each Ctrl+Space — the loser ends up
+    # rapid-firing the error chime at the keyboard autorepeat rate.
+    if not _acquire_single_instance_lock():
+        print(
+            "[voice_paste] Another instance already holds the lock — exiting.",
+            flush=True,
+        )
+        sys.exit(0)
+
     # Auto-update: runs synchronously so a restart happens before the UI appears.
     # Wrapped in a thread with a timeout guard so a slow network can't stall startup.
     update_thread = threading.Thread(target=_check_and_update, daemon=True)
