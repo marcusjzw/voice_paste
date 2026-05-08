@@ -432,9 +432,6 @@ class VoicePasteApp(rumps.App):
 
     # ── Mic selector ─────────────────────────────────────────────────────
     def _build_mic_menu(self):
-        # Attach before populating: rumps.MenuItem.clear() requires the
-        # underlying NSMenu, which is only created once the item is added
-        # to its parent.
         self._mic_menu = rumps.MenuItem("Microphone")
         self.menu.add(self._mic_menu)
         self.menu.add(rumps.separator)
@@ -449,7 +446,12 @@ class VoicePasteApp(rumps.App):
         picked, and so reconnecting auto-resumes the choice.
         """
         global _known_device_names
-        self._mic_menu.clear()
+
+        # MenuItem.clear() crashes if the underlying NSMenu hasn't been
+        # created yet — that only happens once at least one child has been
+        # added. Guard the first build.
+        if getattr(self._mic_menu, "_menu", None) is not None:
+            self._mic_menu.clear()
 
         devices = _get_input_devices()
         connected_names = [name for _, name in devices]
