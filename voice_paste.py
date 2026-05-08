@@ -432,10 +432,13 @@ class VoicePasteApp(rumps.App):
 
     # ── Mic selector ─────────────────────────────────────────────────────
     def _build_mic_menu(self):
+        # Attach before populating: rumps.MenuItem.clear() requires the
+        # underlying NSMenu, which is only created once the item is added
+        # to its parent.
         self._mic_menu = rumps.MenuItem("Microphone")
-        self._populate_mic_menu()
         self.menu.add(self._mic_menu)
         self.menu.add(rumps.separator)
+        self._populate_mic_menu()
 
     def _populate_mic_menu(self):
         """Fill the mic submenu with current input devices.
