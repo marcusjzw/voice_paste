@@ -82,6 +82,10 @@ _last_device_check  = 0.0      # time.time() of last device-list rescan
 _DEVICE_REFRESH_S   = 2.0      # min seconds between mic-menu rebuilds
 _known_device_names: tuple = ()  # cached snapshot of input device names
 
+_audio_level        = 0.0      # exponentially-smoothed RMS of the live stream
+_LEVEL_BARS         = "▁▂▃▄▅▆▇█"  # 8 levels, low → high, for the menu bar meter
+_LEVEL_SCALE        = 25.0     # RMS multiplier; ~0.04 RMS → bar 1, ~0.3 RMS → bar 7
+
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
 
@@ -258,11 +262,17 @@ def _resolve_device_index(name: str | None) -> tuple[int | None, bool]:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def _audio_callback(indata, frames, t, status) -> None:
-    """PortAudio callback — appends frames while recording is active."""
+    """PortAudio callback — appends frames and updates the live level meter."""
+    global _audio_level
     if status:
         print(f"[voice_paste] Audio status: {status}", flush=True)
     if _recording:
         _frames.append(indata.copy())
+        if indata.size:
+            block_rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+            # Exponential smoothing — fast attack, gentle decay so the bar
+            # stays readable instead of strobing on every 64 ms callback.
+            _audio_level = 0.55 * _audio_level + 0.45 * block_rms
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -317,7 +327,7 @@ def _transcribe_and_paste() -> None:
 
 def _start_recording() -> None:
     """Open the input stream synchronously and only enter recording state on success."""
-    global _recording, _recording_start, _stream, _frames
+    global _recording, _recording_start, _stream, _frames, _audio_level
 
     with _state_lock:
         if _recording:
@@ -331,6 +341,7 @@ def _start_recording() -> None:
             device_index = None  # one-shot fallback; selection preserved for reconnect
 
         _frames = []
+        _audio_level = 0.0
         try:
             stream = sd.InputStream(
                 device=device_index,
@@ -533,7 +544,8 @@ class VoicePasteApp(rumps.App):
 
         if _recording:
             elapsed = int(time.time() - _recording_start)
-            self.title = f"🔴 {elapsed}s"
+            idx = min(len(_LEVEL_BARS) - 1, int(_audio_level * _LEVEL_SCALE))
+            self.title = f"🔴 {elapsed}s {_LEVEL_BARS[idx]}"
         elif _transcribing:
             self.title = _SPINNER[_spinner_idx % len(_SPINNER)]
             _spinner_idx += 1
