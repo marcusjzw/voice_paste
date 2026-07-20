@@ -21,6 +21,7 @@ import subprocess
 import pathlib
 import fcntl
 import collections
+import json
 
 import numpy as np
 import sounddevice as sd
@@ -79,6 +80,14 @@ _ERROR_DEBOUNCE_S = 1.5        # min seconds between consecutive error signals
 _LOCK_FILE        = pathlib.Path(__file__).parent / "voice_paste.lock"
 _lock_fh          = None       # held-open file handle for the single-instance flock
 _DEVICE_PREF_FILE = pathlib.Path(__file__).parent / "selected_device.txt"  # persisted mic choice
+_USAGE_FILE       = pathlib.Path(__file__).parent / "usage.jsonl"  # local spend log (one JSON record per clip)
+
+# gpt-4o-transcribe pricing (USD). The transcription API returns exact per-call
+# token usage, so we price that directly; the per-minute rate is a fallback for
+# when the API reports duration instead of tokens. Update if OpenAI changes it.
+_PRICE_INPUT_PER_M  = 2.50     # USD per 1M input tokens (audio+text)
+_PRICE_OUTPUT_PER_M = 10.00    # USD per 1M output tokens
+_PRICE_PER_MINUTE   = 0.006    # USD per audio minute (fallback estimate)
 
 _last_device_check  = 0.0      # time.time() of last device-list rescan
 _DEVICE_REFRESH_S   = 2.0      # min seconds between mic-menu rebuilds
@@ -495,6 +504,99 @@ def _send_cmd_v() -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
 
+# ── Usage / cost tracking ────────────────────────────────────────────────────
+
+def _clip_cost(usage, duration_s: float) -> float:
+    """USD cost of one transcription. Uses the API's reported token usage when
+    available; falls back to audio duration × per-minute rate otherwise."""
+    try:
+        if usage is not None:
+            utype = getattr(usage, "type", None)
+            if utype == "tokens":
+                inp = getattr(usage, "input_tokens", 0) or 0
+                out = getattr(usage, "output_tokens", 0) or 0
+                return (inp / 1e6 * _PRICE_INPUT_PER_M
+                        + out / 1e6 * _PRICE_OUTPUT_PER_M)
+            if utype == "duration":
+                secs = getattr(usage, "seconds", 0) or 0
+                return secs / 60.0 * _PRICE_PER_MINUTE
+    except Exception:
+        pass
+    return (duration_s or 0.0) / 60.0 * _PRICE_PER_MINUTE
+
+
+def _record_usage(usage, duration_s: float) -> None:
+    """Append one clip's usage to the local spend log. Never raises."""
+    try:
+        rec = {
+            "ts": time.time(),
+            "dur_s": round(float(duration_s or 0.0), 3),
+            "in_tok": int(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
+            "out_tok": int(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
+            "cost": _clip_cost(usage, duration_s),
+        }
+        with open(_USAGE_FILE, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as exc:
+        print(f"[voice_paste] usage log error: {exc}", flush=True)
+
+
+def _fmt_usd(c: float) -> str:
+    return f"${c:,.2f}" if c >= 1 else f"${c:.4f}"
+
+
+def _usage_summary() -> str:
+    """Human-readable day/week/month/all-time spend rollup for the menu alert."""
+    if not _USAGE_FILE.exists():
+        return ("No usage yet.\n\n"
+                "Hold Ctrl+Space to transcribe something, then check back here.")
+    now = time.time()
+    windows = [("Last 24 hours", 86_400),
+               ("Last 7 days", 7 * 86_400),
+               ("Last 30 days", 30 * 86_400)]
+    agg = {name: [0.0, 0, 0.0] for name, _ in windows}   # [cost, count, seconds]
+    total = [0.0, 0, 0.0]
+    first_ts = None
+    try:
+        with open(_USAGE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                ts = rec.get("ts", 0.0)
+                cost = float(rec.get("cost", 0.0) or 0.0)
+                dur = float(rec.get("dur_s", 0.0) or 0.0)
+                first_ts = ts if first_ts is None else min(first_ts, ts)
+                total[0] += cost; total[1] += 1; total[2] += dur
+                for name, span in windows:
+                    if now - ts <= span:
+                        b = agg[name]
+                        b[0] += cost; b[1] += 1; b[2] += dur
+    except Exception as exc:
+        return f"Couldn't read usage log:\n{exc}"
+
+    # Columns are laid out for a monospaced font (see _on_view_usage); the
+    # alert renders this in SF Mono so everything lines up as a table.
+    def _row(name, stats):
+        c, n, d = stats
+        return f"{name:<14}{_fmt_usd(c):>9}{n:>7}{d / 60:>8.1f}"
+
+    lines = [f"{'':<14}{'Cost':>9}{'Clips':>7}{'Min':>8}"]
+    lines += [_row(name, agg[name]) for name, _ in windows]
+    lines.append("")
+    lines.append(_row("All time", total))
+    since = (time.strftime("%b %-d, %Y", time.localtime(first_ts))
+             if first_ts else "today")
+    lines.append(f"Since {since}")
+    lines.append("")
+    lines.append(f"Estimated from {MODEL} token usage.")
+    return "\n".join(lines)
+
+
 def _transcribe_and_paste() -> None:
     global _transcribing
     if not _frames:
@@ -504,6 +606,7 @@ def _transcribe_and_paste() -> None:
 
     audio = np.concatenate(_frames, axis=0).flatten()
     pcm   = (audio * 32_767).astype(np.int16)
+    duration_s = audio.size / SAMPLE_RATE if audio.size else 0.0
 
     # Report captured level. A peak of exactly 0.0 means the OS handed us pure
     # silence — almost always a missing Microphone grant, which would otherwise
@@ -529,6 +632,7 @@ def _transcribe_and_paste() -> None:
                 kw["language"] = LANGUAGE
             result = client.audio.transcriptions.create(**kw)
 
+        _record_usage(getattr(result, "usage", None), duration_s)
         text = result.text.strip()
         print(f' done -> "{text}"')
 
@@ -665,6 +769,7 @@ class VoicePasteApp(rumps.App):
         ver_item = rumps.MenuItem(f"VoicePaste v{VERSION}")
         ver_item.set_callback(None)
         self.menu.add(ver_item)
+        self.menu.add(rumps.MenuItem("View Usage", callback=self._on_view_usage))
         self.menu.add(rumps.MenuItem("Restart", callback=self._on_restart))
         self.menu.add(rumps.separator)
 
@@ -719,6 +824,42 @@ class VoicePasteApp(rumps.App):
             ghost._device_name = _selected_device_name
             ghost.state = 1
             self._mic_menu.add(ghost)
+
+    def _on_view_usage(self, _):
+        text = _usage_summary()
+        try:
+            import AppKit
+            alert = AppKit.NSAlert.alloc().init()
+            alert.setMessageText_("VoicePaste usage")
+            alert.addButtonWithTitle_("Close")
+
+            # Monospaced accessory view so the columns line up as a table
+            # (NSAlert's own text is proportional and can't align).
+            font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(
+                12.0, getattr(AppKit, "NSFontWeightRegular", 0.0))
+            char_w = font.advancementForGlyph_(font.glyphWithName_("space")).width or 7.2
+            maxlen = max((len(l) for l in text.splitlines()), default=24)
+            n_lines = text.count("\n") + 1
+            width = maxlen * char_w + 16
+            height = n_lines * 16.0 + 6
+
+            tf = AppKit.NSTextField.alloc().initWithFrame_(
+                AppKit.NSMakeRect(0, 0, width, height))
+            tf.setEditable_(False)
+            tf.setSelectable_(True)
+            tf.setBezeled_(False)
+            tf.setDrawsBackground_(False)
+            tf.setUsesSingleLineMode_(False)
+            tf.setFont_(font)
+            tf.setStringValue_(text)
+            alert.setAccessoryView_(tf)
+            alert.runModal()
+        except Exception as exc:
+            print(f"[voice_paste] usage view error: {exc}", flush=True)
+            try:
+                rumps.alert(title="VoicePaste usage", message=text, ok="Close")
+            except Exception:
+                pass
 
     def _on_restart(self, _):
         print("[voice_paste] Restarting…", flush=True)
