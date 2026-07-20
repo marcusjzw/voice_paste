@@ -107,6 +107,7 @@ _level_history      = collections.deque(
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
+_starting = True     # True until startup (incl. update check) finishes — shows a loading spinner
 
 # ── Stop chime (plays on release via NSSound on the main thread) ──────────────
 try:
@@ -863,12 +864,14 @@ class VoicePasteApp(rumps.App):
 
     def _on_restart(self, _):
         print("[voice_paste] Restarting…", flush=True)
+        # Bounce the LaunchAgent so the fresh process starts in launchd's
+        # session context (where the menu-bar icon registers correctly).
+        # kickstart -k kills this instance and relaunches it.
         subprocess.Popen(
-            [sys.executable, str(pathlib.Path(__file__).resolve())],
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.voicepaste"],
             start_new_session=True,
             close_fds=True,
         )
-        rumps.quit_application()
 
     def _on_mic_select(self, sender):
         global _selected_device_name
@@ -922,6 +925,10 @@ class VoicePasteApp(rumps.App):
         elif _transcribing:
             self.title = _SPINNER[_spinner_idx % len(_SPINNER)]
             _spinner_idx += 1
+        elif _starting:
+            # Loading state while startup / update check runs.
+            self.title = f"🎙 {_SPINNER[_spinner_idx % len(_SPINNER)]}"
+            _spinner_idx += 1
         elif time.time() < _error_until:
             if self.title != "⚠️":
                 self.title = "⚠️"
@@ -953,11 +960,15 @@ if __name__ == "__main__":
     # so a slow user response can't delay the menu bar appearing.
     threading.Thread(target=_check_permissions, daemon=True).start()
 
-    # Auto-update: runs synchronously so a restart happens before the UI appears.
-    # Wrapped in a thread with a timeout guard so a slow network can't stall startup.
-    update_thread = threading.Thread(target=_check_and_update, daemon=True)
-    update_thread.start()
-    update_thread.join(timeout=15)   # max 15 s wait; continue regardless
+    # Auto-update runs in the background so the menu-bar icon appears quickly;
+    # the icon shows a loading spinner (see sync_title) until this finishes.
+    def _startup_update():
+        global _starting
+        try:
+            _check_and_update()
+        finally:
+            _starting = False
+    threading.Thread(target=_startup_update, daemon=True).start()
 
     listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
     listener.start()
