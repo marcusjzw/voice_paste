@@ -20,6 +20,7 @@ import tempfile
 import subprocess
 import pathlib
 import fcntl
+import collections
 
 import numpy as np
 import sounddevice as sd
@@ -83,9 +84,17 @@ _last_device_check  = 0.0      # time.time() of last device-list rescan
 _DEVICE_REFRESH_S   = 2.0      # min seconds between mic-menu rebuilds
 _known_device_names: tuple = ()  # cached snapshot of input device names
 
-_audio_level        = 0.0      # exponentially-smoothed RMS of the live stream
-_LEVEL_BARS         = "▁▂▃▄▅▆▇█"  # 8 levels, low → high, for the menu bar meter
-_LEVEL_SCALE        = 25.0     # RMS multiplier; ~0.04 RMS → bar 1, ~0.3 RMS → bar 7
+_level_peak         = 0.0      # loudest RMS seen since the last meter tick
+_METER_GLYPHS       = "⣀⣤⣶⣿"   # 4 braille bar heights, low → high (finer than blocks)
+_METER_WIDTH        = 10       # scrolling waveform columns shown in the menu bar
+# Perceptual (dB) window: speech RMS spans a wide range, so a linear scale
+# leaves the bar stuck near the bottom. Map RMS in dB across this window to the
+# full bar height instead — quiet and loud both register.
+_METER_DB_FLOOR     = -50.0    # RMS at/below this → shortest bar
+_METER_DB_CEIL      = -20.0    # RMS at/above this → tallest bar
+_level_history      = collections.deque(
+    [_METER_GLYPHS[0]] * _METER_WIDTH, maxlen=_METER_WIDTH
+)
 
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _spinner_idx = 0
@@ -436,18 +445,29 @@ def _resolve_device_index(name: str | None) -> tuple[int | None, bool]:
 # ║  AUDIO CAPTURE                                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
+def _level_to_glyph(rms: float) -> str:
+    """Map an RMS amplitude to a bar glyph on a perceptual (dB) scale."""
+    if rms <= 1e-6:
+        return _METER_GLYPHS[0]
+    db = 20.0 * float(np.log10(rms))
+    unit = (db - _METER_DB_FLOOR) / (_METER_DB_CEIL - _METER_DB_FLOOR)
+    unit = min(1.0, max(0.0, unit))
+    return _METER_GLYPHS[int(unit * (len(_METER_GLYPHS) - 1) + 0.5)]
+
+
 def _audio_callback(indata, frames, t, status) -> None:
-    """PortAudio callback — appends frames and updates the live level meter."""
-    global _audio_level
+    """PortAudio callback — appends frames and tracks the live level meter."""
+    global _level_peak
     if status:
         print(f"[voice_paste] Audio status: {status}", flush=True)
     if _recording:
         _frames.append(indata.copy())
         if indata.size:
             block_rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-            # Exponential smoothing — fast attack, gentle decay so the bar
-            # stays readable instead of strobing on every 64 ms callback.
-            _audio_level = 0.55 * _audio_level + 0.45 * block_rms
+            # Hold the loudest block since the last display tick; the meter
+            # samples and resets this each tick. Peak (not average) keeps the
+            # waveform lively and responsive to real speech transients.
+            _level_peak = max(_level_peak, block_rms)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -532,7 +552,7 @@ def _transcribe_and_paste() -> None:
 
 def _start_recording() -> None:
     """Open the input stream synchronously and only enter recording state on success."""
-    global _recording, _recording_start, _stream, _frames, _audio_level
+    global _recording, _recording_start, _stream, _frames, _level_peak
 
     with _state_lock:
         if _recording:
@@ -546,14 +566,16 @@ def _start_recording() -> None:
             device_index = None  # one-shot fallback; selection preserved for reconnect
 
         _frames = []
-        _audio_level = 0.0
+        _level_peak = 0.0
+        _level_history.clear()
+        _level_history.extend([_METER_GLYPHS[0]] * _METER_WIDTH)
         try:
             stream = sd.InputStream(
                 device=device_index,
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="float32",
-                blocksize=1024,
+                blocksize=256,   # ~62 level updates/s @ 16 kHz — feeds the 30 Hz meter
                 callback=_audio_callback,
             )
             stream.start()
@@ -720,10 +742,10 @@ class VoicePasteApp(rumps.App):
         _save_device_pref()
         print(f"[voice_paste] Microphone set to: {label}")
 
-    # ── Timer: updates icon on main thread every 100ms ───────────────────
-    @rumps.timer(0.1)
+    # ── Timer: updates icon on main thread ~30×/s ────────────────────────
+    @rumps.timer(0.033)
     def sync_title(self, _):
-        global _spinner_idx, _last_device_check
+        global _spinner_idx, _last_device_check, _level_peak
 
         # Hide from Dock on first tick — main thread, fully initialised by now
         if not hasattr(self, "_dock_hidden"):
@@ -750,8 +772,12 @@ class VoicePasteApp(rumps.App):
 
         if _recording:
             elapsed = int(time.time() - _recording_start)
-            idx = min(len(_LEVEL_BARS) - 1, int(_audio_level * _LEVEL_SCALE))
-            self.title = f"🔴 {elapsed}s {_LEVEL_BARS[idx]}"
+            # Sample-and-reset the peak level for this tick, then scroll it into
+            # the waveform history so the bars flow left as you speak.
+            peak = _level_peak
+            _level_peak = 0.0
+            _level_history.append(_level_to_glyph(peak))
+            self.title = f"🔴 {elapsed}s {''.join(_level_history)}"
         elif _transcribing:
             self.title = _SPINNER[_spinner_idx % len(_SPINNER)]
             _spinner_idx += 1
