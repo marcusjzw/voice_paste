@@ -25,3 +25,4 @@ env/
 
 # macOS
 .DS_Store
+selected_device.txt

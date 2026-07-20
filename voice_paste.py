@@ -77,6 +77,7 @@ _last_error_at    = 0.0        # time.time() of the most recent error chime
 _ERROR_DEBOUNCE_S = 1.5        # min seconds between consecutive error signals
 _LOCK_FILE        = pathlib.Path(__file__).parent / "voice_paste.lock"
 _lock_fh          = None       # held-open file handle for the single-instance flock
+_DEVICE_PREF_FILE = pathlib.Path(__file__).parent / "selected_device.txt"  # persisted mic choice
 
 _last_device_check  = 0.0      # time.time() of last device-list rescan
 _DEVICE_REFRESH_S   = 2.0      # min seconds between mic-menu rebuilds
@@ -158,6 +159,152 @@ def _signal_capture_error(reason: str) -> None:
     _notify("VoicePaste — microphone unavailable", reason)
 
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  PERMISSIONS (macOS TCC)                                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# VoicePaste needs two grants, both attached to the host .app bundle:
+#   • Microphone    — to record audio
+#   • Accessibility — for the global Ctrl+Space hotkey (pynput input monitoring)
+#
+# Running inside a real .app bundle (not a bare `python` LaunchAgent) is what
+# lets macOS raise these prompts and list the app in System Settings. We request
+# them *proactively* at startup so the user gets a deterministic dialog instead
+# of having to spam the hotkey to coax the microphone prompt out.
+
+def _open_privacy_pane(anchor: str) -> None:
+    """Open a specific System Settings → Privacy & Security pane."""
+    try:
+        subprocess.run(
+            ["open", f"x-apple.systempreferences:com.apple.preference.security?{anchor}"],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def _ensure_microphone_access(timeout_s: float = 30.0) -> bool:
+    """True if mic access is authorized. Raises the system prompt when the state
+    is undetermined; opens the Microphone pane (and notifies) when denied."""
+    try:
+        import AVFoundation
+        audio = AVFoundation.AVMediaTypeAudio
+        status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(audio)
+        # 0 notDetermined, 1 restricted, 2 denied, 3 authorized
+        if status == 3:
+            return True
+        if status == 0:
+            print("[voice_paste] Requesting microphone access…", flush=True)
+            done = threading.Event()
+            AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                audio, lambda granted: done.set()
+            )
+            done.wait(timeout=timeout_s)
+            if AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(audio) == 3:
+                print("[voice_paste] Microphone access granted.", flush=True)
+                return True
+        print("[voice_paste] Microphone access NOT granted.", flush=True)
+        _notify("VoicePaste needs Microphone access",
+                "Enable VoicePaste under Privacy & Security → Microphone.")
+        _open_privacy_pane("Privacy_Microphone")
+        return False
+    except ImportError:
+        return _warmup_microphone_fallback()
+    except Exception as exc:
+        print(f"[voice_paste] Mic permission check error: {exc}", flush=True)
+        return True  # fail open — the recording path surfaces real device errors
+
+
+def _warmup_microphone_fallback() -> bool:
+    """Fallback when AVFoundation is unavailable: a short capture trips the prompt
+    the first time, and pure-zero output betrays a missing grant."""
+    try:
+        dev, _ = _resolve_device_index(_selected_device_name)
+        rec = sd.rec(int(0.3 * SAMPLE_RATE), samplerate=SAMPLE_RATE,
+                     channels=CHANNELS, dtype="float32", device=dev)
+        sd.wait()
+        if float(np.max(np.abs(rec))) == 0.0:
+            _notify("VoicePaste needs Microphone access",
+                    "Enable VoicePaste under Privacy & Security → Microphone.")
+            _open_privacy_pane("Privacy_Microphone")
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _ensure_accessibility_access() -> bool:
+    """True if this process is a trusted Accessibility client (needed for the
+    global hotkey). When untrusted, raises the system prompt and opens the pane."""
+    try:
+        from ApplicationServices import (
+            AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
+        )
+        trusted = bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}))
+        if not trusted:
+            print("[voice_paste] Accessibility not granted — prompted.", flush=True)
+            _notify("VoicePaste needs Accessibility access",
+                    "Enable VoicePaste under Privacy & Security → Accessibility, "
+                    "then quit and reopen VoicePaste.")
+            _open_privacy_pane("Privacy_Accessibility")
+        return trusted
+    except Exception as exc:
+        print(f"[voice_paste] Accessibility check error: {exc}", flush=True)
+        return True
+
+
+def _prompt_microphone_if_needed() -> None:
+    """Raise the macOS microphone prompt — MUST run on the main thread.
+
+    AVCaptureDevice.requestAccess only presents the TCC dialog while the main
+    run loop is spinning. Issued from a background thread (or before rumps'
+    run loop starts) it silently resolves to 'denied' and the app never even
+    appears in System Settings → Privacy → Microphone. We call this right
+    before _app.run() and return immediately; the completion handler is
+    delivered — and the prompt shown — once the run loop starts.
+    """
+    try:
+        import AVFoundation
+        audio = AVFoundation.AVMediaTypeAudio
+        status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(audio)
+        # 0 notDetermined, 1 restricted, 2 denied, 3 authorized
+        if status == 3:
+            return
+        if status == 0:
+            print("[voice_paste] Requesting microphone access (prompt)…", flush=True)
+            AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                audio,
+                lambda granted: print(
+                    f"[voice_paste] Microphone access {'granted' if granted else 'denied'}.",
+                    flush=True),
+            )
+            return
+        # denied / restricted — macOS won't re-prompt; guide the user to Settings.
+        print("[voice_paste] Microphone access denied — opening Settings.", flush=True)
+        _notify("VoicePaste needs Microphone access",
+                "Enable VoicePaste under Privacy & Security → Microphone.")
+        _open_privacy_pane("Privacy_Microphone")
+    except Exception as exc:
+        print(f"[voice_paste] Mic prompt error: {exc}", flush=True)
+
+
+def _check_permissions() -> None:
+    """Report permission status + ensure Accessibility at startup. The
+    Microphone prompt is raised separately on the main thread (see
+    _prompt_microphone_if_needed) because it needs the run loop; here we only
+    read the current mic status so this is safe to run on a background thread."""
+    acc = _ensure_accessibility_access()
+    try:
+        import AVFoundation
+        mic = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+            AVFoundation.AVMediaTypeAudio) == 3
+    except Exception:
+        mic = True  # fail open — the recording path surfaces real device errors
+    print(f"[voice_paste] Permissions — microphone: {'ok' if mic else 'pending'}, "
+          f"accessibility: {'ok' if acc else 'MISSING'}", flush=True)
+
+
 def _acquire_single_instance_lock() -> bool:
     """Try to take an exclusive flock so only one VoicePaste runs at a time.
 
@@ -182,6 +329,34 @@ def _acquire_single_instance_lock() -> bool:
     except Exception:
         pass
     return True
+
+
+def _load_device_pref() -> None:
+    """Restore the saved mic choice into _selected_device_name at startup.
+
+    The selection lives only in memory otherwise, so without this it resets to
+    the system default on every restart — and this daemon restarts often.
+    """
+    global _selected_device_name
+    try:
+        if _DEVICE_PREF_FILE.exists():
+            name = _DEVICE_PREF_FILE.read_text().strip()
+            _selected_device_name = name or None
+            if _selected_device_name:
+                print(f"[voice_paste] Restored mic preference: {_selected_device_name}", flush=True)
+    except Exception as exc:
+        print(f"[voice_paste] Could not read mic preference: {exc}", flush=True)
+
+
+def _save_device_pref() -> None:
+    """Persist the current mic choice so it survives restarts."""
+    try:
+        if _selected_device_name is None:
+            _DEVICE_PREF_FILE.unlink(missing_ok=True)
+        else:
+            _DEVICE_PREF_FILE.write_text(_selected_device_name + "\n")
+    except Exception as exc:
+        print(f"[voice_paste] Could not save mic preference: {exc}", flush=True)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -279,6 +454,27 @@ def _audio_callback(indata, frames, t, status) -> None:
 # ║  TRANSCRIPTION + PASTE                                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
+def _send_cmd_v() -> None:
+    """Synthesise ⌘V using a raw virtual keycode via Quartz.
+
+    We deliberately avoid pynput's Controller.tap('v') here: mapping the
+    *character* 'v' to a keycode makes pynput enumerate the Text Input Source
+    (TSM / islGetInputSourceListWithAdditions), which asserts main-thread-only
+    on recent macOS and crashes the process (SIGTRAP) when called from this
+    background transcription thread. Posting the physical keycode
+    (kVK_ANSI_V = 9) needs no input-source lookup and is safe from any thread.
+    """
+    import Quartz
+    KEYCODE_V = 9  # kVK_ANSI_V — physical key, layout-independent
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    down = Quartz.CGEventCreateKeyboardEvent(src, KEYCODE_V, True)
+    Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+    up = Quartz.CGEventCreateKeyboardEvent(src, KEYCODE_V, False)
+    Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+
 def _transcribe_and_paste() -> None:
     global _transcribing
     if not _frames:
@@ -288,6 +484,17 @@ def _transcribe_and_paste() -> None:
 
     audio = np.concatenate(_frames, axis=0).flatten()
     pcm   = (audio * 32_767).astype(np.int16)
+
+    # Report captured level. A peak of exactly 0.0 means the OS handed us pure
+    # silence — almost always a missing Microphone grant, which would otherwise
+    # surface only as garbled "hallucinated" transcripts.
+    _peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if _peak == 0.0:
+        print("[voice_paste] WARNING: captured pure silence (peak=0) — likely no "
+              "Microphone permission. Check Privacy & Security → Microphone.",
+              flush=True)
+        _notify("VoicePaste captured silence",
+                "No microphone signal — check Privacy & Security → Microphone.")
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         tmp = f.name
@@ -308,9 +515,7 @@ def _transcribe_and_paste() -> None:
         if text:
             subprocess.run(["pbcopy"], input=text.encode(), check=True)
             time.sleep(0.08)
-            kb = keyboard.Controller()
-            with kb.pressed(keyboard.Key.cmd):
-                kb.tap("v")
+            _send_cmd_v()
         else:
             print("[voice_paste] Whisper returned empty transcript.")
 
@@ -512,6 +717,7 @@ class VoicePasteApp(rumps.App):
                 item.state = 1 if item._device_name == _selected_device_name else 0
 
         label = "System Default" if _selected_device_name is None else sender.title
+        _save_device_pref()
         print(f"[voice_paste] Microphone set to: {label}")
 
     # ── Timer: updates icon on main thread every 100ms ───────────────────
@@ -572,6 +778,14 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
+    # Restore the saved mic choice before the listener/UI start.
+    _load_device_pref()
+
+    # Proactively request Microphone + Accessibility so the prompts appear
+    # deterministically at launch (no need to spam the hotkey). Runs in a thread
+    # so a slow user response can't delay the menu bar appearing.
+    threading.Thread(target=_check_permissions, daemon=True).start()
+
     # Auto-update: runs synchronously so a restart happens before the UI appears.
     # Wrapped in a thread with a timeout guard so a slow network can't stall startup.
     update_thread = threading.Thread(target=_check_and_update, daemon=True)
@@ -589,4 +803,7 @@ if __name__ == "__main__":
     print("─────────────────────────────────────────────\n")
 
     _app = VoicePasteApp()
+    # Raise the mic prompt on the MAIN THREAD; the dialog is presented once
+    # _app.run() starts the run loop (see _prompt_microphone_if_needed).
+    _prompt_microphone_if_needed()
     _app.run()
